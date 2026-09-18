@@ -569,19 +569,103 @@ static void parse_ras_data(struct pthread_data *pdata, struct kbuffer *kbuf,
 }
 
 /**
- * get_num_cpus - obtain the number of online logical CPUs
- * @ras: tracing context (unused)
+ * cmp_cpu - qsort(3) comparator placing CPU numbers in ascending order
+ * @a: pointer to the first CPU number
+ * @b: pointer to the second CPU number
  *
  * Return:
- * the positive number of online logical CPUs. Failure triggers an assertion.
+ * a negative, zero or positive value if @a sorts before, at the same
+ * position as, or after @b.
  */
-static int get_num_cpus(struct ras_events *ras)
+static int cmp_cpu(const void *a, const void *b)
 {
-	int cpus;
+	int cpu_a = *(const int *)a;
+	int cpu_b = *(const int *)b;
 
-	cpus = sysconf(_SC_NPROCESSORS_ONLN);
-	assert(cpus > 0);
-	return cpus;
+	return (cpu_a > cpu_b) - (cpu_a < cpu_b);
+}
+
+/**
+ * get_cpu_list - list the CPUs that have a per-CPU trace buffer
+ * @ras: tracing context
+ * @cpu_list: receives an allocated array of CPU numbers in ascending order
+ *
+ * The Kernel creates one per_cpu/cpuN directory for each possible CPU,
+ * whether or not CPU N is currently online, and CPU numbers are sparse
+ * while some CPUs are offline. So, neither the number of online CPUs nor
+ * the number of configured CPUs can be used as the upper bound of a
+ * contiguous range of CPU numbers. Read the per_cpu directory instead, as
+ * it tells exactly which per-CPU trace buffers exist.
+ *
+ * The caller is responsible for freeing @cpu_list on success.
+ *
+ * Return:
+ * * positive - the number of CPUs stored at @cpu_list
+ * * -ENOENT - no per-CPU trace buffer was found
+ * * -ENOMEM - the CPU list could not be allocated
+ * * otherwise - a negative errno value from strscpy(), strscat() or opendir()
+ */
+static int get_cpu_list(struct ras_events *ras, int **cpu_list)
+{
+	int num_cpus = 0, allocated = 0;
+	char fname[MAX_PATH + 1];
+	struct dirent *entry;
+	int *list = NULL;
+	DIR *dir;
+	int rc;
+
+	rc = strscpy(fname, ras->tracing, sizeof(fname));
+	if (rc < 0)
+		return rc;
+	rc = strscat(fname, "/per_cpu", sizeof(fname));
+	if (rc < 0)
+		return rc;
+
+	dir = opendir(fname);
+	if (!dir)
+		return -errno;
+
+	for (entry = readdir(dir); entry; entry = readdir(dir)) {
+		char *endptr;
+		long cpu;
+
+		if (strncmp(entry->d_name, "cpu", 3))
+			continue;
+
+		errno = 0;
+		cpu = strtol(entry->d_name + 3, &endptr, 10);
+		if (errno || endptr == entry->d_name + 3 || *endptr)
+			continue;
+		if (cpu < 0 || cpu > INT_MAX)
+			continue;
+
+		if (num_cpus == allocated) {
+			int new_size = allocated ? 2 * allocated : 16;
+			int *new_list;
+
+			new_list = realloc(list, new_size * sizeof(*list));
+			if (!new_list) {
+				free(list);
+				closedir(dir);
+				return -ENOMEM;
+			}
+			list = new_list;
+			allocated = new_size;
+		}
+
+		list[num_cpus++] = cpu;
+	}
+	closedir(dir);
+
+	if (!num_cpus) {
+		free(list);
+		return -ENOENT;
+	}
+
+	qsort(list, num_cpus, sizeof(*list), cmp_cpu);
+	*cpu_list = list;
+
+	return num_cpus;
 }
 
 /**
@@ -693,7 +777,7 @@ static int read_ras_event_all_cpus(struct pthread_data *pdata,
 
 		/* FIXME: use select to open for all CPUs */
 		snprintf(pipe_raw, sizeof(pipe_raw),
-			 "per_cpu/cpu%d/trace_pipe_raw", i);
+			 "per_cpu/cpu%d/trace_pipe_raw", pdata[i].cpu);
 
 		fds[i].fd = open_trace(pdata[0].ras, pipe_raw, O_RDONLY);
 		if (fds[i].fd < 0) {
@@ -718,7 +802,8 @@ static int read_ras_event_all_cpus(struct pthread_data *pdata,
 		goto cleanup;
 	}
 
-	log(TERM, LOG_INFO, "Listening to events for cpus 0 to %d\n", n_cpus - 1);
+	log(TERM, LOG_INFO, "Listening to events on %u cpus (cpu%d to cpu%d)\n",
+	    n_cpus, pdata[0].cpu, pdata[n_cpus - 1].cpu);
 	do {
 		ready = poll(fds, (n_cpus + 1), -1);
 		if (ready < 0) {
@@ -1554,8 +1639,9 @@ int handle_ras_events(struct ras_events *ras)
 {
 	struct pthread_data *data = NULL;
 	int rc = EXIT_SUCCESS, i;
-	unsigned int cpus;
+	int *cpu_list = NULL;
 	int num_events;
+	int cpus;
 
 	if (!ras || !ras->pevent) {
 		log(ALL, LOG_INFO, "RAS structure is missing. Aborting.\n");
@@ -1563,7 +1649,6 @@ int handle_ras_events(struct ras_events *ras)
 	}
 
 	num_events = ras->num_events;
-	cpus = get_num_cpus(ras);
 
 	if (!num_events) {
 		log(ALL, LOG_INFO, "No events to monitor were selected\n");
@@ -1571,17 +1656,28 @@ int handle_ras_events(struct ras_events *ras)
 		goto err;
 	}
 
+	cpus = get_cpu_list(ras, &cpu_list);
+	if (cpus < 0) {
+		log(ALL, LOG_INFO, "Can't list the CPUs to monitor: %s\n",
+		    strerror(-cpus));
+		rc = cpus;
+		goto err;
+	}
+
 	data = calloc(cpus, sizeof(*data));
 	if (!data) {
 		log(ALL, LOG_INFO, "Can't allocate per-cpu data.\n");
+		free(cpu_list);
 		rc = -ENOMEM;
 		goto err;
 	}
 
 	for (i = 0; i < cpus; i++) {
 		data[i].ras = ras;
-		data[i].cpu = i;
+		data[i].cpu = cpu_list[i];
 	}
+
+	free(cpu_list);
 
 	/*
 	 * Start monitoring trace events using modern kernel approach.
